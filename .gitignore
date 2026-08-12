@@ -20,6 +20,12 @@ ENV/
 dist/
 build/
 
+# Claude Code
+.claude/
+
+# Project scripts
+run.cmd
+
 # IDE
 .idea/
 .vscode/
