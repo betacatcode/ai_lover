@@ -1,0 +1,36 @@
+# Noelle Telegram Bot 配置模板
+# 复制为 config.yaml 并填入真实值
+
+telegram:
+  bot_token: "YOUR_TELEGRAM_BOT_TOKEN"   # 从 @BotFather 获取
+  allowed_user_id: 123456789             # 你的 Telegram 用户 ID（仅此用户可与 Bot 交互）
+
+llm:
+  base_url: "https://api.longcat.chat/openai/v1"  # LongCat 代理地址
+  api_key: "YOUR_LONGCAT_API_KEY"                 # LongCat API Key
+  model: "LongCat-Flash-Chat"                     # 模型名称，按 LongCat 文档填写
+
+chat:
+  history_window: 15        # 滑动窗口：保留最近 N 轮对话原文
+  summary_threshold: 30     # 超过此轮数触发摘要压缩
+  max_tokens: 4096          # 单次回复最大 token 数
+
+affection:
+  initial_level: 1          # 初始好感度等级
+  initial_points: 0         # 初始经验值
+
+emotion:
+  default: "平静"           # 默认情绪
+
+memory:
+  db:
+    host: "localhost"
+    port: 5432
+    user: "noelle"
+    password: "YOUR_DB_PASSWORD"
+    database: "noelle"
+  embedding:
+    # 向量生成方式: "local" (sentence-transformers) 或 "api" (调用 embedding 接口)
+    mode: "local"
+    model: "paraphrase-multilingual-MiniLM-L12-v2"  # 本地模型名，支持中文
+    dimension: 384  # 该模型输出维度，需与 pgvector 列维度一致

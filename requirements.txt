@@ -1,0 +1,14 @@
+aiogram>=3.10.0
+langchain>=0.3.0
+langchain-openai>=0.2.0
+openai>=1.40.0
+apscheduler>=3.10.0
+pyyaml>=6.0
+
+# PostgreSQL + 向量
+asyncpg>=0.29.0       # 异步 PG 驱动
+pgvector>=0.2.0       # Python 端向量支持
+sqlalchemy>=2.0.0     # ORM + 连接池（可选，方便建表）
+
+# Embedding（本地模式）
+sentence-transformers>=3.0.0
