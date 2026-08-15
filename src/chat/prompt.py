@@ -1,8 +1,12 @@
-"""Prompt 模板与组装 — Layer 1 基础人设"""
+"""Prompt 模板与组装 — Layer 1-5 动态组装"""
 
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..systems.affection import AffectionState
 
 logger = logging.getLogger(__name__)
 
@@ -39,28 +43,32 @@ NOELLE_PERSONA = """你是诺艾尔（Noelle），原神中西风骑士团的女
 
 
 def build_system_prompt(
-    affection_level: int = 1,
+    affection_state: AffectionState | None = None,
     emotion: str = "平静",
 ) -> str:
     """
-    组装 system prompt（当前仅 Layer 1，后续扩展好感度/情绪/记忆层）。
+    组装 system prompt（Layer 1-5 动态组装）。
 
     Args:
-        affection_level: 当前好感度等级（1-5）
-        emotion: 当前情绪状态
+        affection_state: 当前好感度状态，None 时使用默认等级 1
+        emotion: 当前情绪状态（预留，后续 emotion-system 使用）
 
     Returns:
         完整的 system prompt 文本
     """
-    parts = [NOELLE_PERSONA]
+    parts: list[str] = [NOELLE_PERSONA]
 
-    # 后续任务组 3/4/5 将在这里追加好感度、情绪、记忆层
-    # TODO: Layer 2 - 好感度称呼和行为指令
+    # Layer 2: 好感度状态注入
+    if affection_state is not None:
+        from ..systems.affection import build_affection_prompt_layer
+        parts.append(build_affection_prompt_layer(affection_state))
+
     # TODO: Layer 3 - 情绪语气风格指令
     # TODO: Layer 4 - 长期记忆注入
     # TODO: Layer 5 - 对话摘要注入
 
     system_prompt = "\n\n".join(parts)
-    logger.debug("组装 system prompt: %d chars (affection=%d, emotion=%s)",
-                 len(system_prompt), affection_level, emotion)
+    level_str = affection_state.level.title if affection_state else "默认"
+    logger.debug("组装 system prompt: %d chars (affection=%s, emotion=%s)",
+                 len(system_prompt), level_str, emotion)
     return system_prompt

@@ -7,6 +7,7 @@ import logging
 from ..config import AppConfig
 from ..llm.client import LLMClient
 from ..llm.exceptions import LLMError, LLMTimeoutError
+from ..systems.affection import AffectionSystem, InMemoryAffectionRepository
 from .history import ChatHistoryManager
 from .prompt import build_system_prompt
 
@@ -35,7 +36,15 @@ class ChatService:
         self._llm = llm_client
         self._config = config
         self._history = ChatHistoryManager(window_size=config.chat.history_window)
-        logger.info("ChatService 初始化完成")
+
+        # 好感度系统（MVP 使用内存存储，后续可替换为 PostgreSQL）
+        affection_repo = InMemoryAffectionRepository()
+        self._affection = AffectionSystem(
+            repository=affection_repo,
+            initial_level=config.affection.initial_level,
+            initial_points=config.affection.initial_points,
+        )
+        logger.info("ChatService 初始化完成（好感度系统已启用）")
 
     async def chat(self, user_id: int, message: str) -> str:
         """
@@ -50,14 +59,18 @@ class ChatService:
         """
         logger.info("聊天请求: user_id=%d, message=%r", user_id, message[:50])
 
-        # 1. 组装 system prompt（后续会加入好感度/情绪/记忆）
-        system_prompt = build_system_prompt()
+        # 1. 获取好感度状态并处理消息（更新好感度）
+        affection_result = await self._affection.process_message(user_id, message)
+        affection_state = affection_result.new_state
 
-        # 2. 获取历史 + 当前消息
+        # 2. 组装 system prompt（含好感度层）
+        system_prompt = build_system_prompt(affection_state=affection_state)
+
+        # 3. 获取历史 + 当前消息
         history = self._history.get_history(user_id)
         messages = history + [{"role": "user", "content": message}]
 
-        # 3. 调用 LLM（带降级处理）
+        # 4. 调用 LLM（带降级处理）
         try:
             reply = await self._llm.complete(messages, system_prompt=system_prompt)
         except LLMTimeoutError:
@@ -67,11 +80,12 @@ class ChatService:
             logger.error("LLM 错误，使用降级回复: %s", e)
             reply = FALLBACK_REPLIES[hash(user_id) % len(FALLBACK_REPLIES)]
 
-        # 4. 保存到历史
+        # 5. 保存到历史
         self._history.add_message(user_id, "user", message)
         self._history.add_message(user_id, "assistant", reply)
 
-        logger.info("聊天回复: user_id=%d, reply=%d chars", user_id, len(reply))
+        logger.info("聊天回复: user_id=%d, reply=%d chars, affection=%s(%d)",
+                    user_id, len(reply), affection_state.level.title, affection_state.points)
         return reply
 
     def get_history(self, user_id: int) -> list[dict]:
