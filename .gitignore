@@ -39,3 +39,4 @@ logs/
 .DS_Store
 Thumbs.db
 ___
+test_longcat_result.txt
