@@ -22,6 +22,10 @@ affection:
 emotion:
   default: "平静"           # 默认情绪
 
+web:
+  host: "127.0.0.1"         # FastAPI 监听地址（默认仅本机）
+  port: 8000                # FastAPI 监听端口
+
 memory:
   db:
     host: "127.0.0.1"

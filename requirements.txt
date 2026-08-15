@@ -5,6 +5,11 @@ openai>=1.40.0
 apscheduler>=3.10.0
 pyyaml>=6.0
 
+# FastAPI Web
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.0.0
+
 # PostgreSQL + 向量
 asyncpg>=0.29.0       # 异步 PG 驱动
 pgvector>=0.2.0       # Python 端向量支持
