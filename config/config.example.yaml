@@ -24,9 +24,9 @@ emotion:
 
 memory:
   db:
-    host: "localhost"
+    host: "127.0.0.1"
     port: 5432
-    user: "noelle"
+    user: "postgres"
     password: "YOUR_DB_PASSWORD"
     database: "noelle"
   embedding:
