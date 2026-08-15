@@ -1,6 +1,8 @@
-"""好感度系统单元测试 — 覆盖数据模型、变化规则、Prompt 注入、阶段转换"""
+"""好感度系统单元测试 — 覆盖数据模型、LLM 评估、Prompt 注入、阶段转换"""
 
 from __future__ import annotations
+
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -9,8 +11,8 @@ from src.systems.affection import (
     AffectionState,
     AffectionSystem,
     InMemoryAffectionRepository,
-    analyze_message,
     build_affection_prompt_layer,
+    evaluate_affection_delta,
     get_transition_message,
 )
 
@@ -132,75 +134,99 @@ class TestAffectionState:
         assert new_state.points == 1000
 
 
-# ── analyze_message 关键词匹配测试 ──
+# ── LLM 好感度评估测试 ──
 
 
-class TestAnalyzeMessage:
-    """消息好感度分析测试"""
+class TestEvaluateAffectionDelta:
+    """LLM 好感度评估函数测试"""
 
-    def test_empty_message(self):
-        """空消息返回 0"""
-        assert analyze_message("") == 0
+    @pytest.mark.asyncio
+    async def test_positive_evaluation(self):
+        """LLM 返回正数"""
+        mock_llm = AsyncMock()
+        mock_llm.complete = AsyncMock(return_value="5")
+        state = AffectionState.new(user_id=1, initial_points=50)
+        delta = await evaluate_affection_delta(mock_llm, state, "你好呀", "你好！")
+        assert delta == 5
 
-    def test_neutral_message(self):
-        """中性消息返回 0"""
-        assert analyze_message("今天星期三") == 0
-        assert analyze_message("abc XYZ 123") == 0
+    @pytest.mark.asyncio
+    async def test_negative_evaluation(self):
+        """LLM 返回负数"""
+        mock_llm = AsyncMock()
+        mock_llm.complete = AsyncMock(return_value="-10")
+        state = AffectionState.new(user_id=1, initial_points=50)
+        delta = await evaluate_affection_delta(mock_llm, state, "滚", "...")
+        assert delta == -10
 
-    def test_positive_high_weight(self):
-        """高权重正面关键词"""
-        assert analyze_message("我喜欢你") == 15
-        assert analyze_message("我爱你") == 15
-        assert analyze_message("想你了") == 15
-
-    def test_positive_medium_weight(self):
-        """中权重正面关键词"""
-        assert analyze_message("谢谢你的帮助") == 8
-        assert analyze_message("辛苦了") == 8
-
-    def test_positive_low_weight(self):
-        """低权重正面关键词"""
-        assert analyze_message("哈哈好的") == 2
-
-    def test_negative_high_weight(self):
-        """高权重负面关键词"""
-        assert analyze_message("烦死了") == -15
-        assert analyze_message("滚") == -15
-
-    def test_negative_medium_weight(self):
-        """中权重负面关键词"""
-        assert analyze_message("别烦我") == -10
-
-    def test_combined_message(self):
-        """混合消息取总和"""
-        # "谢谢" (+8) + "哈哈" (+2) = +10
-        delta = analyze_message("谢谢你的礼物，哈哈")
-        assert delta == 10
-
-    def test_positive_negative_cancel(self):
-        """正负抵消"""
-        # "喜欢你" (+15) + "烦死了" (-15) = 0
-        delta = analyze_message("喜欢你但有时也烦死了")
+    @pytest.mark.asyncio
+    async def test_zero_evaluation(self):
+        """LLM 返回 0"""
+        mock_llm = AsyncMock()
+        mock_llm.complete = AsyncMock(return_value="0")
+        state = AffectionState.new(user_id=1, initial_points=50)
+        delta = await evaluate_affection_delta(mock_llm, state, "哦", "嗯")
         assert delta == 0
 
-    def test_max_delta_cap(self):
-        """单次变化上限保护"""
-        # 多个高权重正面词，但总和不应超过 +20
-        msg = "喜欢你爱你想你亲亲抱抱"
-        delta = analyze_message(msg)
-        assert delta <= 20
+    @pytest.mark.asyncio
+    async def test_clamped_to_max(self):
+        """超过 +20 被截断"""
+        mock_llm = AsyncMock()
+        mock_llm.complete = AsyncMock(return_value="50")
+        state = AffectionState.new(user_id=1, initial_points=50)
+        delta = await evaluate_affection_delta(mock_llm, state, "test", "test")
+        assert delta == 20
 
-    def test_min_delta_cap(self):
-        """单次变化下限保护"""
-        # 多个高权重负面词，但总和不应低于 -20
-        msg = "烦死了滚讨厌你"
-        delta = analyze_message(msg)
-        assert delta >= -20
+    @pytest.mark.asyncio
+    async def test_clamped_to_min(self):
+        """低于 -20 被截断"""
+        mock_llm = AsyncMock()
+        mock_llm.complete = AsyncMock(return_value="-100")
+        state = AffectionState.new(user_id=1, initial_points=50)
+        delta = await evaluate_affection_delta(mock_llm, state, "test", "test")
+        assert delta == -20
 
-    def test_chinese_laughter(self):
-        """中文笑声"""
-        assert analyze_message("哈哈哈哈") == 2
-        assert analyze_message("好搞笑哈哈哈") == 2
+    @pytest.mark.asyncio
+    async def test_unparseable_response_defaults_zero(self):
+        """无法解析的回复默认 0"""
+        mock_llm = AsyncMock()
+        mock_llm.complete = AsyncMock(return_value="我无法判断")
+        state = AffectionState.new(user_id=1, initial_points=50)
+        delta = await evaluate_affection_delta(mock_llm, state, "test", "test")
+        assert delta == 0
+
+    @pytest.mark.asyncio
+    async def test_llm_error_defaults_zero(self):
+        """LLM 异常默认 0"""
+        mock_llm = AsyncMock()
+        mock_llm.complete = AsyncMock(side_effect=Exception("API error"))
+        state = AffectionState.new(user_id=1, initial_points=50)
+        delta = await evaluate_affection_delta(mock_llm, state, "test", "test")
+        assert delta == 0
+
+    @pytest.mark.asyncio
+    async def test_extracts_integer_from_text(self):
+        """从文本中提取整数"""
+        mock_llm = AsyncMock()
+        mock_llm.complete = AsyncMock(return_value="我认为应该 +5 分")
+        state = AffectionState.new(user_id=1, initial_points=50)
+        delta = await evaluate_affection_delta(mock_llm, state, "test", "test")
+        assert delta == 5
+
+    @pytest.mark.asyncio
+    async def test_prompt_includes_context(self):
+        """评估 Prompt 包含上下文信息"""
+        mock_llm = AsyncMock()
+        mock_llm.complete = AsyncMock(return_value="5")
+        state = AffectionState.new(user_id=1, initial_points=50)
+        await evaluate_affection_delta(mock_llm, state, "用户消息内容", "诺艾尔回复内容")
+        # 验证调用参数中包含上下文
+        call_args = mock_llm.complete.call_args
+        messages = call_args[1].get("messages") or call_args[0][0]
+        prompt_text = messages[0]["content"]
+        assert "陌生" in prompt_text  # 当前关系阶段
+        assert "50" in prompt_text  # 当前经验值
+        assert "用户消息内容" in prompt_text
+        assert "诺艾尔回复内容" in prompt_text
 
 
 # ── 阶段变化过渡消息测试 ──
@@ -244,7 +270,7 @@ class TestPromptLayer:
         prompt = build_affection_prompt_layer(state)
         assert "陌生" in prompt
         assert "0/100" in prompt
-        assert "礼貌但略显生疏" in prompt
+        assert "刚刚认识" in prompt
 
     def test_trust_prompt(self):
         """信赖阶段的 Prompt"""
@@ -281,8 +307,16 @@ class TestAffectionSystem:
         return InMemoryAffectionRepository()
 
     @pytest.fixture()
-    def system(self, repo):
-        return AffectionSystem(repo, initial_level=1, initial_points=0)
+    def mock_llm(self):
+        """模拟 LLM 客户端"""
+        mock = AsyncMock()
+        # 默认返回 +5
+        mock.complete = AsyncMock(return_value="5")
+        return mock
+
+    @pytest.fixture()
+    def system(self, repo, mock_llm):
+        return AffectionSystem(repo, mock_llm, initial_level=1, initial_points=0)
 
     @pytest.mark.asyncio
     async def test_get_state_creates_initial(self, system):
@@ -293,83 +327,115 @@ class TestAffectionSystem:
         assert state.points == 0
 
     @pytest.mark.asyncio
-    async def test_process_message_positive(self, system):
-        """正面消息增加好感度"""
-        result = await system.process_message(1, "谢谢你，诺艾尔")
-        assert result.points_delta > 0
-        assert result.new_state.points > 0
-        assert result.level_changed is False  # 单次不足以升级
+    async def test_process_message_with_llm_positive(self, system, mock_llm):
+        """LLM 返回正数，好感度增加"""
+        mock_llm.complete = AsyncMock(return_value="10")
+        result = await system.process_message(1, "你好呀", "你好！有什么可以帮你的吗？")
+        assert result.points_delta == 10
+        assert result.new_state.points == 10
+        assert result.level_changed is False
         assert result.transition_message is None
 
     @pytest.mark.asyncio
-    async def test_process_message_negative(self, system):
-        """负面消息减少好感度"""
-        # 先积累一些好感
-        await system.process_message(1, "喜欢你")
-        result = await system.process_message(1, "烦死了")
-        assert result.points_delta < 0
+    async def test_process_message_with_llm_negative(self, system, mock_llm):
+        """LLM 返回负数，好感度减少"""
+        mock_llm.complete = AsyncMock(return_value="-15")
+        result = await system.process_message(1, "滚", "好的...")
+        assert result.points_delta == -15
 
     @pytest.mark.asyncio
-    async def test_process_message_neutral(self, system):
-        """中性消息不变"""
-        result = await system.process_message(1, "今天星期三")
+    async def test_process_message_neutral(self, system, mock_llm):
+        """LLM 返回 0，好感度不变"""
+        mock_llm.complete = AsyncMock(return_value="0")
+        result = await system.process_message(1, "今天星期三", "这样啊")
         assert result.points_delta == 0
         assert result.new_state.points == 0
 
     @pytest.mark.asyncio
-    async def test_points_never_negative(self, system):
+    async def test_points_never_negative(self, system, mock_llm):
         """经验值不会低于 0"""
-        result = await system.process_message(1, "烦死了滚讨厌你别烦我闭嘴")
+        mock_llm.complete = AsyncMock(return_value="-20")
+        # 先积累一些好感
+        mock_llm.complete = AsyncMock(return_value="10")
+        await system.process_message(1, "你好", "你好")
+        # 再大幅减少
+        mock_llm.complete = AsyncMock(return_value="-20")
+        result = await system.process_message(1, "烦死了", "...")
         assert result.new_state.points >= 0
 
     @pytest.mark.asyncio
-    async def test_level_upgrade(self, system):
+    async def test_level_upgrade(self, system, mock_llm):
         """好感度升级流程"""
-        # 直接设置一个接近升级的状态
         from src.systems.affection import AffectionState
         await system._repo.save(AffectionState(
             user_id=1, level=AffectionLevel.STRANGER, points=95
         ))
-        result = await system.process_message(1, "我喜欢你")  # +15
+        mock_llm.complete = AsyncMock(return_value="15")
+        result = await system.process_message(1, "我喜欢你", "谢、谢谢...")
         assert result.level_changed is True
         assert result.new_state.level == AffectionLevel.ACQUAINTANCE
         assert result.transition_message is not None
 
     @pytest.mark.asyncio
-    async def test_level_upgrade_to_partner(self, system):
+    async def test_level_upgrade_to_partner(self, system, mock_llm):
         """升级到伴侣等级"""
         from src.systems.affection import AffectionState
         await system._repo.save(AffectionState(
             user_id=1, level=AffectionLevel.INTIMATE, points=990
         ))
-        result = await system.process_message(1, "我爱你，永远在一起")  # +15
+        mock_llm.complete = AsyncMock(return_value="15")
+        result = await system.process_message(1, "我爱你，永远在一起", "我也爱你...")
         assert result.new_state.level == AffectionLevel.PARTNER
         assert result.transition_message is not None
         assert "爱意" in result.transition_message
 
     @pytest.mark.asyncio
-    async def test_multiple_users_isolated(self, system):
+    async def test_multiple_users_isolated(self, system, mock_llm):
         """多用户数据隔离"""
-        result1 = await system.process_message(1, "喜欢你")
-        result2 = await system.process_message(2, "谢谢你")
-        assert result1.new_state.points != result2.new_state.points
+        mock_llm.complete = AsyncMock(return_value="15")
+        result1 = await system.process_message(1, "喜欢你", "谢谢")
+        result2 = await system.process_message(2, "谢谢你", "不客气")
+        # 用户 1 加了 15，用户 2 也加了 15（从 0 开始）
+        assert result1.new_state.points == 15
+        assert result2.new_state.points == 15
 
     @pytest.mark.asyncio
-    async def test_state_persistence(self, system):
+    async def test_state_persistence(self, system, mock_llm):
         """状态持久化到仓库"""
-        await system.process_message(1, "喜欢你")
+        mock_llm.complete = AsyncMock(return_value="10")
+        await system.process_message(1, "你好", "你好")
         state = await system._repo.get(1)
         assert state is not None
-        assert state.points > 0
+        assert state.points == 10
 
     @pytest.mark.asyncio
-    async def test_get_prompt_layer_via_system(self, system):
+    async def test_get_prompt_layer_via_system(self, system, mock_llm):
         """通过系统获取 Prompt 层"""
-        await system.process_message(1, "喜欢你")
+        mock_llm.complete = AsyncMock(return_value="5")
+        await system.process_message(1, "你好", "你好")
         state = await system.get_state(1)
         prompt = system.get_prompt_layer(state)
         assert "好感度状态" in prompt
-        assert "陌生" in prompt  # 15 分仍在陌生阶段
+        assert "陌生" in prompt  # 5 分仍在陌生阶段
+
+    @pytest.mark.asyncio
+    async def test_no_llm_defaults_zero(self, repo):
+        """没有 LLM 时默认变化为 0"""
+        system = AffectionSystem(repo, None, initial_level=1, initial_points=0)
+        result = await system.process_message(1, "你好", "你好")
+        assert result.points_delta == 0
+        assert result.new_state.points == 0
+
+    @pytest.mark.asyncio
+    async def test_llm_called_with_context(self, system, mock_llm):
+        """LLM 被传入正确的上下文"""
+        mock_llm.complete = AsyncMock(return_value="5")
+        await system.process_message(1, "用户说的消息", "诺艾尔的回复")
+        call_args = mock_llm.complete.call_args
+        messages = call_args[1].get("messages") or call_args[0][0]
+        prompt_text = messages[0]["content"]
+        assert "用户说的消息" in prompt_text
+        assert "诺艾尔的回复" in prompt_text
 
 
 # ── 边界条件测试 ──
@@ -377,35 +443,6 @@ class TestAffectionSystem:
 
 class TestEdgeCases:
     """边界条件测试"""
-
-    def test_very_long_message(self):
-        """超长消息不崩溃"""
-        long_msg = "哈哈" * 10000
-        delta = analyze_message(long_msg)
-        assert delta == 2  # 只计一次
-
-    def test_special_characters(self):
-        """特殊字符不崩溃"""
-        delta = analyze_message("!@#$%^&*()")
-        assert delta == 0
-
-    def test_mixed_chinese_english(self):
-        """中英混合"""
-        delta = analyze_message("哈哈 thank you 谢谢")
-        # "哈哈" (+2) + "谢谢" (+8) = +10
-        assert delta == 10
-
-    @pytest.mark.asyncio
-    async def test_concurrent_same_user(self):
-        """同一用户快速连续消息"""
-        repo = InMemoryAffectionRepository()
-        system = AffectionSystem(repo, initial_level=1, initial_points=0)
-        results = []
-        for _ in range(10):
-            r = await system.process_message(1, "喜欢你")
-            results.append(r)
-        # 最后一条应该升级（15 * 10 = 150 >= 100）
-        assert results[-1].new_state.level == AffectionLevel.ACQUAINTANCE
 
     def test_all_levels_have_unique_behaviors(self):
         """每个等级的行为指令各不相同"""
@@ -416,6 +453,38 @@ class TestEdgeCases:
         """枚举可比较大小"""
         assert AffectionLevel.STRANGER < AffectionLevel.ACQUAINTANCE
         assert AffectionLevel.PARTNER > AffectionLevel.TRUST
+
+    def test_next_threshold(self):
+        """next_threshold 属性"""
+        assert AffectionLevel.STRANGER.next_threshold == 100
+        assert AffectionLevel.ACQUAINTANCE.next_threshold == 300
+        assert AffectionLevel.TRUST.next_threshold == 600
+        assert AffectionLevel.INTIMATE.next_threshold == 1000
+        assert AffectionLevel.PARTNER.next_threshold is None
+
+    @pytest.mark.asyncio
+    async def test_consecutive_messages_accumulate(self):
+        """连续消息累积经验值"""
+        repo = InMemoryAffectionRepository()
+        mock_llm = AsyncMock()
+        mock_llm.complete = AsyncMock(return_value="10")
+        system = AffectionSystem(repo, mock_llm, initial_level=1, initial_points=0)
+        results = []
+        for _ in range(5):
+            r = await system.process_message(1, "你好", "你好")
+            results.append(r)
+        # 5 * 10 = 50 分
+        assert results[-1].new_state.points == 50
+
+    @pytest.mark.asyncio
+    async def test_spam_same_message_no_llm(self):
+        """没有 LLM 时重复消息不涨分"""
+        repo = InMemoryAffectionRepository()
+        system = AffectionSystem(repo, None, initial_level=1, initial_points=0)
+        for _ in range(100):
+            await system.process_message(1, "喜欢你", "谢谢")
+        state = await system.get_state(1)
+        assert state.points == 0  # 没有 LLM 评估，不变
 
 
 # ── 经验值边界精确测试 ──

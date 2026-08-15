@@ -1,4 +1,4 @@
-"""好感度系统 — 5 阶段关系模型、变化规则、Prompt 注入"""
+"""好感度系统 — 5 阶段关系模型、LLM 评估、Prompt 注入"""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import ClassVar
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +39,7 @@ class AffectionLevel(IntEnum):
 
     @property
     def threshold(self) -> int:
-        """当前等级的经验值门槛（达到此分数所需的经验值）"""
+        """当前等级的经验值门槛"""
         return _LEVEL_THRESHOLDS[self]
 
     @property
@@ -82,8 +81,9 @@ _LEVEL_ADDRESSES: dict[AffectionLevel, str] = {
 _LEVEL_BEHAVIORS: dict[AffectionLevel, str] = {
     AffectionLevel.STRANGER: (
         "## 当前关系状态：陌生\n"
-        "你们刚刚认识不久，还不太熟悉。诺艾尔保持礼貌但略显生疏的态度，"
-        "用敬称「你」称呼对方，回答简洁有礼，不会主动展开话题。"
+        "你们刚刚认识，完全不熟。诺艾尔保持礼貌但生疏的态度，"
+        "回复简短（一到两句话），不会主动展开话题，不会说太多话。"
+        "对方说奇怪的话时表现出疑惑或警惕。"
     ),
     AffectionLevel.ACQUAINTANCE: (
         "## 当前关系状态：认识\n"
@@ -193,147 +193,151 @@ class InMemoryAffectionRepository(AffectionRepository):
 
 
 class PostgresAffectionRepository(AffectionRepository):
-    """PostgreSQL 存储（生产环境）"""
-
-    # 建表 SQL
-    CREATE_TABLE_SQL: ClassVar[str] = """
-        CREATE TABLE IF NOT EXISTS affection (
-            user_id     BIGINT PRIMARY KEY,
-            level       INTEGER NOT NULL DEFAULT 1,
-            points      INTEGER NOT NULL DEFAULT 0,
-            updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-    """
+    """PostgreSQL 存储（生产环境，使用 SQLAlchemy async）"""
 
     def __init__(self, dsn: str) -> None:
         """
         Args:
             dsn: PostgreSQL 连接字符串，如 postgresql://user:pass@host:5432/dbname
         """
-        self._dsn = dsn
-        self._pool = None
-
-    async def _get_pool(self):
-        """懒加载连接池"""
-        if self._pool is None:
-            import asyncpg
-            self._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=5)
-        return self._pool
+        from ..db.session import init_db
+        # 将 postgresql:// 转换为 postgresql+asyncpg://
+        if dsn.startswith("postgresql://"):
+            dsn = dsn.replace("postgresql://", "postgresql+asyncpg://", 1)
+        init_db(dsn)
 
     async def create_table(self) -> None:
         """创建好感度表"""
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(self.CREATE_TABLE_SQL)
+        from ..db.session import create_tables
+        await create_tables()
         logger.info("好感度表创建/确认完成")
 
     async def get(self, user_id: int) -> AffectionState | None:
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT user_id, level, points FROM affection WHERE user_id = $1",
-                user_id,
+        from ..db.models import AffectionModel
+        from ..db.session import get_session
+        from sqlalchemy import select
+
+        async for session in get_session():
+            result = await session.execute(
+                select(AffectionModel).where(AffectionModel.user_id == user_id)
             )
-        if row is None:
-            return None
-        return AffectionState(
-            user_id=row["user_id"],
-            level=AffectionLevel(row["level"]),
-            points=row["points"],
-        )
+            model = result.scalar_one_or_none()
+            if model is None:
+                return None
+            return AffectionState(
+                user_id=model.user_id,
+                level=AffectionLevel(model.level),
+                points=model.points,
+            )
 
     async def save(self, state: AffectionState) -> None:
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO affection (user_id, level, points, updated_at)
-                VALUES ($1, $2, $3, NOW())
-                ON CONFLICT (user_id) DO UPDATE
-                    SET level = EXCLUDED.level,
-                        points = EXCLUDED.points,
-                        updated_at = NOW();
-                """,
-                state.user_id,
-                state.level.value,
-                state.points,
+        from ..db.models import AffectionModel
+        from ..db.session import get_session
+
+        async for session in get_session():
+            model = AffectionModel(
+                user_id=state.user_id,
+                level=state.level.value,
+                points=state.points,
             )
+            await session.merge(model)
+            await session.commit()
 
     async def close(self) -> None:
-        """关闭连接池"""
-        if self._pool is not None:
-            await self._pool.close()
-            self._pool = None
+        """关闭数据库连接"""
+        from ..db.session import close_db
+        await close_db()
 
 
-# ── 变化规则 ──
+# ── LLM 好感度评估 ──
+
+# 评估 Prompt 模板
+_EVALUATION_PROMPT = """你是诺艾尔（Noelle），西风骑士团的女仆。现在需要你以诺艾尔的视角，评估用户对你好感度的变化。
+
+## 当前关系状态
+- 关系阶段：{level_title}
+- 当前经验值：{points} / {next_threshold}
+
+## 对话内容
+用户消息：{user_message}
+你的回复：{noelle_reply}
+
+## 评估任务
+请根据以上对话，判断这次互动让你对用户的亲近感增加了还是减少了。
+
+评估原则：
+1. **考虑当前关系阶段**：同一个行为在不同关系阶段意义不同
+   - 陌生人说「喜欢你」可能让你觉得奇怪或轻浮，不应加分甚至减分
+   - 亲密的人说「喜欢你」会让你开心，应加分
+2. **考虑对话语境和语气**：真诚的关心加分，敷衍/机械重复/刷好感的行为不加分
+3. **考虑互动自然度**：自然的对话加分，刻意的、不合时宜的亲密行为减分
+4. **考虑内容实质**：有实质性内容的交流（分享生活、互相帮助）> 空洞的情话
+
+评分标准：
+- +15 ~ +20：非常开心的互动，真诚的亲密表达（需关系足够亲密）
+- +5 ~ +10：愉快的互动，正常的友好交流
+- +1 ~ +4：普通的对话，略有温度
+- 0：中性对话，没有特别感觉
+- -1 ~ -4：有些不舒服或无聊
+- -5 ~ -10：明显让人反感的行为
+- -11 ~ -20：非常让人讨厌的行为
+
+请只返回一个整数表示经验值变化，例如：5 或 -3 或 0
+只返回数字，不要其他内容。"""
 
 
-# 正面关键词 → 经验值增减
-# 按权重分组，避免单一消息暴涨
-_POSITIVE_KEYWORDS: list[tuple[list[str], int]] = [
-    # 高权重：明确表达好感
-    (["喜欢你", "爱你", "想你", "最爱", "亲亲", "抱抱"], 15),
-    (["可爱", "漂亮", "温柔", "体贴"], 10),
-    # 中权重：关心和感谢
-    (["谢谢", "感谢", "辛苦了", "帮了大忙"], 8),
-    (["在干嘛", "吃了吗", "睡了吗", "还好吗", "身体"], 5),
-    (["早安", "晚安", "晚安"], 5),
-    # 低权重：友好互动
-    (["哈哈", "不错", "好的", "嗯嗯"], 2),
-]
-
-_NEGATIVE_KEYWORDS: list[tuple[list[str], int]] = [
-    (["烦死了", "滚", "讨厌你", "无聊"], -15),
-    (["别烦", "闭嘴", "不想理你"], -10),
-    (["不好", "不行", "算了"], -3),
-]
-
-# 单次消息经验值变化上限（防刷）
-MAX_DELTA_PER_MESSAGE: int = 20
-MIN_DELTA_PER_MESSAGE: int = -20
+# 用于从 LLM 回复中提取整数
+_INTEGER_RE = re.compile(r"-?\d+")
 
 
-def analyze_message(message: str) -> int:
+async def evaluate_affection_delta(
+    llm_client,  # LLMClient
+    state: AffectionState,
+    user_message: str,
+    noelle_reply: str,
+) -> int:
     """
-    分析单条消息的好感度经验值变化。
-
-    基于关键词匹配，返回经验值变化量（可正可负）。
-    单次变化受 MAX_DELTA_PER_MESSAGE 限制。
+    调用 LLM 评估本次交互的好感度变化。
 
     Args:
-        message: 用户消息文本
+        llm_client: LLM 客户端实例
+        state: 当前好感度状态
+        user_message: 用户消息
+        noelle_reply: 诺艾尔的回复
 
     Returns:
-        经验值变化量
+        经验值变化量（-20 到 +20），解析失败返回 0
     """
-    if not message:
+    next_threshold = state.level.next_threshold
+    next_threshold_str = str(next_threshold) if next_threshold else "∞"
+
+    prompt = _EVALUATION_PROMPT.format(
+        level_title=state.level.title,
+        points=state.points,
+        next_threshold=next_threshold_str,
+        user_message=user_message,
+        noelle_reply=noelle_reply,
+    )
+
+    try:
+        result = await llm_client.complete(
+            messages=[{"role": "user", "content": prompt}],
+            system_prompt=None,
+        )
+        # 从回复中提取第一个整数
+        match = _INTEGER_RE.search(result.strip())
+        if match:
+            delta = int(match.group())
+            # 限制范围
+            delta = max(-20, min(20, delta))
+            logger.debug("LLM 好感度评估: %d (raw: %s)", delta, result.strip()[:50])
+            return delta
+        else:
+            logger.warning("LLM 好感度评估无法解析: %s", result.strip()[:100])
+            return 0
+    except Exception as e:
+        logger.warning("LLM 好感度评估失败，默认 0: %s", e)
         return 0
-
-    delta = 0
-    message_lower = message.lower()
-
-    # 正面关键词
-    for keywords, weight in _POSITIVE_KEYWORDS:
-        for kw in keywords:
-            if kw in message_lower:
-                delta += weight
-                break  # 每组只计一次
-
-    # 负面关键词
-    for keywords, weight in _NEGATIVE_KEYWORDS:
-        for kw in keywords:
-            if kw in message_lower:
-                delta += weight
-                break
-
-    # 限制单次变化幅度
-    delta = max(MIN_DELTA_PER_MESSAGE, min(MAX_DELTA_PER_MESSAGE, delta))
-
-    if delta != 0:
-        logger.debug("好感度分析: message=%r, delta=%d", message[:30], delta)
-
-    return delta
 
 
 # ── 阶段变化处理 ──
@@ -381,8 +385,8 @@ class AffectionSystem:
 
     用法：
         repo = InMemoryAffectionRepository()
-        system = AffectionSystem(repo, initial_level=1, initial_points=0)
-        result = await system.process_message(user_id=123, message="你好")
+        system = AffectionSystem(repo, llm_client, initial_level=1, initial_points=0)
+        result = await system.process_message(user_id=123, message="你好", noelle_reply="你好呀")
         # result.new_state, result.points_delta, result.transition_message
     """
 
@@ -399,10 +403,12 @@ class AffectionSystem:
     def __init__(
         self,
         repository: AffectionRepository,
+        llm_client,  # LLMClient | None
         initial_level: int = 1,
         initial_points: int = 0,
     ) -> None:
         self._repo = repository
+        self._llm = llm_client
         self._initial_level = initial_level
         self._initial_points = initial_points
 
@@ -414,19 +420,34 @@ class AffectionSystem:
             await self._repo.save(state)
         return state
 
-    async def process_message(self, user_id: int, message: str) -> Result:
+    async def process_message(
+        self,
+        user_id: int,
+        message: str,
+        noelle_reply: str,
+    ) -> Result:
         """
-        处理用户消息，更新好感度。
+        处理用户消息，通过 LLM 评估更新好感度。
 
         Args:
             user_id: 用户 ID
             message: 用户消息
+            noelle_reply: 诺艾尔的回复（用于上下文评估）
 
         Returns:
             Result 包含变化详情
         """
         old_state = await self.get_state(user_id)
-        delta = analyze_message(message)
+
+        # LLM 评估好感度变化
+        if self._llm is not None:
+            delta = await evaluate_affection_delta(
+                self._llm, old_state, message, noelle_reply
+            )
+        else:
+            # 没有 LLM 时不评估，默认 0
+            delta = 0
+
         new_points = max(0, old_state.points + delta)  # 经验值不低于 0
         new_state = old_state.with_points(new_points)
 
@@ -437,8 +458,8 @@ class AffectionSystem:
 
         if level_changed:
             logger.info(
-                "好感度升级: user_id=%d, %s → %s (%d pts)",
-                user_id, old_state.level.title, new_state.level.title, new_points,
+                "好感度升级: user_id=%d, %s → %s (%d pts, delta=%d)",
+                user_id, old_state.level.title, new_state.level.title, new_points, delta,
             )
         elif delta != 0:
             logger.debug(

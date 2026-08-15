@@ -105,5 +105,17 @@ async def handle_message(message: Message) -> None:
         return
 
     # 通过 ChatService 调用 LLM
-    reply = await _chat_service.chat(user_id, user_text)
+    result = await _chat_service.chat(user_id, user_text)
+
+    # 组装回复（debug 模式附带状态信息）
+    reply = result.reply
+    if _chat_service._config.debug.enabled:
+        debug_info = (
+            f"\n\n---\n"
+            f"❤️ {result.affection_level} ({result.affection_points}) "
+            f"{'+' if result.affection_delta >= 0 else ''}{result.affection_delta} | "
+            f"😊 {result.emotion}"
+        )
+        reply = reply + debug_info
+
     await _safe_reply(message, reply)

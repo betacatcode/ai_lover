@@ -50,6 +50,11 @@ class EmotionConfig:
 
 
 @dataclass
+class DebugConfig:
+    enabled: bool = True  # 开启时回复末尾附带好感度/情绪信息
+
+
+@dataclass
 class DBConfig:
     host: str = "127.0.0.1"
     port: int = 5432
@@ -89,6 +94,7 @@ class AppConfig:
     chat: ChatConfig = field(default_factory=ChatConfig)
     affection: AffectionConfig = field(default_factory=AffectionConfig)
     emotion: EmotionConfig = field(default_factory=EmotionConfig)
+    debug: DebugConfig = field(default_factory=DebugConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     web: WebConfig = field(default_factory=WebConfig)
 
@@ -133,6 +139,9 @@ def _parse_config(raw: dict) -> AppConfig:
         ),
         emotion=EmotionConfig(
             default=raw.get("emotion", {}).get("default", "平静"),
+        ),
+        debug=DebugConfig(
+            enabled=raw.get("debug", {}).get("enabled", True),
         ),
         memory=MemoryConfig(
             db=DBConfig(
