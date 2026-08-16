@@ -122,11 +122,22 @@ async def handle_message(message: Message) -> None:
     # 组装回复（debug 模式附带状态信息）
     reply = result.reply
     if _chat_service._config.debug.enabled:
+        user_id = message.from_user.id if message.from_user else 0
+
+        # 获取当前情绪 emoji
+        emotion_state = await _chat_service._emotion.get_state(user_id)
+        emotion_emoji = emotion_state.emoji
+
+        # 获取好感度对应爱心颜色
+        from ..systems.emotion import _AFFECTION_HEART
+        affection_state = await _chat_service._affection.get_state(user_id)
+        heart = _AFFECTION_HEART.get(affection_state.level.value, "❤️")
+
         debug_info = (
             f"\n\n---\n"
-            f"❤️ {result.affection_level} ({result.affection_points}) "
+            f"{heart} {result.affection_level} ({result.affection_points}) "
             f"{'+' if result.affection_delta >= 0 else ''}{result.affection_delta} | "
-            f"😊 {result.emotion}"
+            f"{emotion_emoji} {result.emotion}"
         )
         reply = reply + debug_info
 

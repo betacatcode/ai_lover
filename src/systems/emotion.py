@@ -44,6 +44,27 @@ _DEFAULT_INTENSITIES: dict[EmotionType, int] = {
 }
 
 
+# ── Emoji 映射（debug 显示用）──
+
+_EMOTION_EMOJI: dict[EmotionType, str] = {
+    EmotionType.HAPPY: "😊",
+    EmotionType.WORRIED: "😟",
+    EmotionType.LONELY: "🥺",
+    EmotionType.SAD: "😢",
+    EmotionType.ANGRY: "😤",
+    EmotionType.CALM: "😌",
+}
+
+# 好感度对应爱心颜色
+_AFFECTION_HEART: dict[int, str] = {
+    1: "🤍",  # 陌生
+    2: "💙",  # 认识
+    3: "💛",  # 信赖
+    4: "🧡",  # 亲密
+    5: "❤️",  # 伴侣
+}
+
+
 # ── 语气风格指令（注入 Prompt Layer 3）──
 
 _EMOTION_PROMPT_LAYERS: dict[EmotionType, str] = {
@@ -120,26 +141,35 @@ class EmotionState:
 
     6 种情绪各有强度值（0+），当前情绪取强度最大的那个。
     全为 0 时视为平静。
+    强度相同时，最近触发的情绪优先（last_triggered 记录）。
+
+    cooldown_rounds: 剩余冷却轮数，>0 时 LLM 触发的情绪变化会被抑制（幅度减半）
     """
     user_id: int
     intensities: dict[EmotionType, int] = field(default_factory=lambda: dict(_DEFAULT_INTENSITIES))
+    cooldown_rounds: int = 0  # 情绪切换冷却轮数
+    last_triggered: EmotionType | None = None  # 最近被触发的情绪（用于平局决胜）
 
     @classmethod
     def new(cls, user_id: int) -> EmotionState:
         """创建初始状态（全 0，即平静）"""
-        return cls(user_id=user_id, intensities=dict(_DEFAULT_INTENSITIES))
+        return cls(user_id=user_id, intensities=dict(_DEFAULT_INTENSITIES), cooldown_rounds=0, last_triggered=None)
 
     @property
     def current_emotion(self) -> EmotionType:
-        """当前情绪 = 强度最大的那个。全 0 返回平静"""
+        """当前情绪 = 强度最大的那个。全 0 返回平静。强度相同时，最近触发的优先。"""
         max_intensity = max(self.intensities.values())
         if max_intensity <= 0:
             return EmotionType.CALM
-        # 取第一个最大强度的情绪（避免随机）
-        for emotion in EmotionType:
-            if self.intensities.get(emotion, 0) == max_intensity:
-                return emotion
-        return EmotionType.CALM
+        # 找出所有达到最大强度的情绪
+        candidates = [
+            e for e in EmotionType
+            if self.intensities.get(e, 0) == max_intensity
+        ]
+        # 如果有多个，优先返回最近触发的那个
+        if len(candidates) > 1 and self.last_triggered in candidates:
+            return self.last_triggered
+        return candidates[0]
 
     @property
     def current_intensity(self) -> int:
@@ -148,17 +178,39 @@ class EmotionState:
 
     def apply_event(self, event: EmotionEvent) -> None:
         """应用一次情绪变化事件"""
+        # 冷却期：如果目标情绪与当前情绪不同，抑制变化幅度
+        effective_delta = event.delta
+        if self.cooldown_rounds > 0 and event.emotion != self.current_emotion:
+            effective_delta = event.delta // 2  # 幅度减半
+            if effective_delta == 0:
+                effective_delta = 1 if event.delta > 0 else -1
+            logger.debug("情绪冷却中: %s %+d → %+d", event.emotion.value, event.delta, effective_delta)
+
         current = self.intensities.get(event.emotion, 0)
-        new_value = max(0, current + event.delta)  # 不低于 0
+        new_value = max(0, current + effective_delta)  # 不低于 0
         self.intensities[event.emotion] = new_value
+
+        # 记录最近触发的情绪（用于平局决胜）
+        if effective_delta != 0:
+            self.last_triggered = event.emotion
+
+        # 如果情绪实际切换了，进入冷却期
+        if event.emotion == self.current_emotion and abs(event.delta) >= 2:
+            self.cooldown_rounds = 2  # 2 轮冷却
+
         logger.debug(
             "情绪变化: %s %s%d → %d (%s)",
             event.emotion.value,
-            "+" if event.delta >= 0 else "",
-            event.delta,
+            "+" if effective_delta >= 0 else "",
+            effective_delta,
             new_value,
             event.reason[:30] if event.reason else "",
         )
+
+    def tick_cooldown(self) -> None:
+        """每轮对话后递减冷却"""
+        if self.cooldown_rounds > 0:
+            self.cooldown_rounds -= 1
 
     def decay(self, amount: int = 1) -> None:
         """衰减所有非平静情绪"""
@@ -166,6 +218,11 @@ class EmotionState:
             current = self.intensities.get(emotion, 0)
             if current > 0:
                 self.intensities[emotion] = max(0, current - amount)
+
+    @property
+    def emoji(self) -> str:
+        """当前情绪对应的 emoji"""
+        return _EMOTION_EMOJI.get(self.current_emotion, "😌")
 
     def get_prompt_layer(self) -> str:
         """获取当前情绪的 Prompt 注入文本"""
@@ -265,7 +322,7 @@ class PostgresEmotionRepository(EmotionRepository):
 
 _EVALUATION_PROMPT = """你是诺艾尔（Noelle），西风骑士团的女仆。现在需要你以诺艾尔的视角，评估对话对你的情绪影响。
 
-## 当前情绪状态
+## 当前情绪状态（0=无，数字越大越强烈）
 - 开心：{happy}
 - 担心：{worried}
 - 寂寞：{lonely}
@@ -277,28 +334,48 @@ _EVALUATION_PROMPT = """你是诺艾尔（Noelle），西风骑士团的女仆�
 你的回复：{noelle_reply}
 
 ## 评估任务
-请根据以上对话，判断这次互动让你的哪种情绪发生了变化。
+请判断用户这次消息让你产生了什么情绪变化。
 
-评估原则：
-1. **考虑对话语境和语气**：真诚的关心让你开心，敷衍/粗鲁让你生气或难过
-2. **考虑情绪合理性**：
-   - 用户分享开心的事 → 开心增加
-   - 用户表达难过/生病 → 担心增加
-   - 用户粗鲁/骂人 → 生气增加
-   - 用户很久不回复 → 寂寞增加
-   - 用户无视你的主动分享 → 难过增加
-3. **考虑关系阶段**：同样的行为在不同关系阶段情绪反应不同
-4. **不要过度反应**：普通对话不一定每次都要变情绪
+## 触发规则（严格遵守）
 
-变化幅度：
-- +3：非常强烈的刺激（大病、严重表白、严重辱骂）
-- +2：明显的正面/负面事件（升职、失恋、被夸、被忽视）
-- +1：轻微的情绪波动（普通关心、普通分享）
-- 0：无变化
+### 让用户开心（必须真正正面才触发）：
+- 真诚夸奖/感谢 → 开心 +1~2
+- 分享开心的事（升职、约会成功等）→ 开心 +1
+- 主动关心诺艾尔 → 开心 +1
+
+### 让用户担心：
+- 用户说身体不舒服/生病 → 担心 +2
+- 用户表达焦虑/压力大 → 担心 +1
+- 用户遇到困难 → 担心 +1
+
+### 让用户生气（粗鲁/冒犯必触发）：
+- 骂人/说脏话 → 生气 +2~3
+- 傲慢/轻视（"我是你爹""滚""烦死了"）→ 生气 +2
+- 反复无视诺艾尔 → 生气 +1
+- 不尊重/调侃 → 生气 +1
+
+### 让用户难过：
+- 用户说讨厌诺艾尔/不想聊天 → 难过 +2
+- 用户长期不回复 → 难过 +1
+
+### 让用户寂寞：
+- 用户很久没发消息（根据上下文判断）→ 寂寞 +1
+
+## 重要原则
+1. **粗鲁/冒犯必须触发生气**，不要忍让！诺艾尔虽然礼貌但不是软柿子
+2. **普通对话不要变情绪**：打招呼、闲聊、问问题等日常对话 → 返回 delta=0
+3. **只返回最有影响力的那个情绪变化**，不要一次变多个
+4. **考虑当前情绪强度**：如果某种情绪已经很高，再叠加时增幅减小
+
+## 变化幅度
+- +3：极其强烈（严重辱骂、大病、告白）
+- +2：明显事件（被骂、升职、失恋、被忽视）
+- +1：轻微波动（普通关心、普通分享）
+- 0：日常对话，无情绪变化
 
 请返回 JSON 格式：
 ```json
-{{"emotion": "开心|担心|寂寞|难过|生气", "delta": 数字, "reason": "简短原因"}}
+{{"emotion": "开心|担心|寂寞|难过|生气", "delta": 数字, "reason": "20字以内原因"}}
 ```
 
 只返回 JSON，不要其他内容。"""

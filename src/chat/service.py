@@ -116,6 +116,10 @@ class ChatService:
         # 7. LLM 评估情绪变化
         emotion_result = await self._emotion.process_message(user_id, message, reply)
 
+        # 8. 情绪冷却递减（每轮对话后 -1）
+        emotion_result.state.tick_cooldown()
+        await self._emotion._repo.save(emotion_result.state)
+
         # 8. 保存到历史
         self._history.add_message(user_id, "user", message)
         self._history.add_message(user_id, "assistant", reply)
