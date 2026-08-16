@@ -1,4 +1,4 @@
-"""聊天服务 — 统一入口，编排历史/Prompt/LLM/情绪"""
+"""聊天服务 — 统一入口，编排历史/Prompt/LLM/情绪/记忆"""
 
 from __future__ import annotations
 
@@ -8,8 +8,14 @@ from dataclasses import dataclass
 from ..config import AppConfig
 from ..llm.client import LLMClient
 from ..llm.exceptions import LLMError, LLMTimeoutError
-from ..systems.affection import AffectionSystem, InMemoryAffectionRepository
-from ..systems.emotion import EmotionSystem, InMemoryEmotionRepository
+from ..systems.affection import AffectionSystem, InMemoryAffectionRepository, PostgresAffectionRepository
+from ..systems.emotion import EmotionSystem, InMemoryEmotionRepository, PostgresEmotionRepository
+from ..memory.memory_system import MemorySystem
+from ..memory.history import HistoryRepository
+from ..memory.profile import ProfileRepository
+from ..memory.summary import SummaryRepository
+from ..memory.embedding import get_embedding_service
+from ..memory.retriever import MemoryRetriever
 from .filter import filter_reply
 from .history import ChatHistoryManager
 from .prompt import build_system_prompt
@@ -50,8 +56,10 @@ class ChatService:
         self._config = config
         self._history = ChatHistoryManager(window_size=config.chat.history_window)
 
-        # 好感度系统
-        affection_repo = InMemoryAffectionRepository()
+        db_url = config.memory.db.url
+
+        # 好感度系统（DB 持久化）
+        affection_repo = PostgresAffectionRepository(db_url)
         self._affection = AffectionSystem(
             repository=affection_repo,
             llm_client=llm_client,
@@ -59,8 +67,8 @@ class ChatService:
             initial_points=config.affection.initial_points,
         )
 
-        # 情绪系统
-        emotion_repo = InMemoryEmotionRepository()
+        # 情绪系统（DB 持久化）
+        emotion_repo = PostgresEmotionRepository(db_url)
         self._emotion = EmotionSystem(
             repository=emotion_repo,
             llm_client=llm_client,
@@ -68,7 +76,30 @@ class ChatService:
             decay_amount=config.emotion.decay_amount,
         )
 
-        logger.info("ChatService 初始化完成（好感度+情绪系统已启用，LLM 评估模式）")
+        # 记忆系统
+        self._embedding = get_embedding_service(
+            model_name=config.memory.embedding.model,
+            dimension=config.memory.embedding.dimension,
+        )
+        self._history_repo = HistoryRepository(database_url=db_url, window_size=config.chat.history_window)
+        self._profile_repo = ProfileRepository(database_url=db_url)
+        self._summary_repo = SummaryRepository(database_url=db_url, embedding_service=self._embedding)
+        self._retriever = MemoryRetriever(
+            embedding_service=self._embedding,
+            summary_repo=self._summary_repo,
+            profile_repo=self._profile_repo,
+        )
+        self._memory = MemorySystem(
+            llm_client=llm_client,
+            embedding_service=self._embedding,
+            profile_repo=self._profile_repo,
+            summary_repo=self._summary_repo,
+            retriever=self._retriever,
+            history_repo=self._history_repo,
+            trigger_rounds=config.chat.history_window,  # 与滑动窗口一致
+        )
+
+        logger.info("ChatService 初始化完成（好感度+情绪+记忆系统已启用，LLM 评估模式）")
 
     async def chat(self, user_id: int, message: str) -> ChatResult:
         """
@@ -83,14 +114,16 @@ class ChatService:
         """
         logger.info("聊天请求: user_id=%d, message=%r", user_id, message[:50])
 
-        # 1. 获取当前好感度和情绪状态（用于 Prompt 组装）
+        # 1. 获取当前好感度、情绪、记忆状态（用于 Prompt 组装）
         affection_state = await self._affection.get_state(user_id)
         emotion_state = await self._emotion.get_state(user_id)
+        memory_state = await self._memory.get_state(user_id, current_message=message)
 
-        # 2. 组装 system prompt（含好感度层 + 情绪层）
+        # 2. 组装 system prompt（含好感度层 + 情绪层 + 记忆层）
         system_prompt = build_system_prompt(
             affection_state=affection_state,
             emotion_state=emotion_state,
+            memory_state=memory_state,
         )
 
         # 3. 获取历史 + 当前消息
@@ -99,42 +132,54 @@ class ChatService:
 
         # 4. 调用 LLM 生成回复（带降级处理）
         try:
-            reply = await self._llm.complete(messages, system_prompt=system_prompt)
+            raw_reply = await self._llm.complete(messages, system_prompt=system_prompt)
         except LLMTimeoutError:
             logger.warning("LLM 超时，使用降级回复: user_id=%d", user_id)
-            reply = FALLBACK_REPLIES[0]
+            raw_reply = FALLBACK_REPLIES[0]
         except LLMError as e:
             logger.error("LLM 错误，使用降级回复: %s", e)
-            reply = FALLBACK_REPLIES[hash(user_id) % len(FALLBACK_REPLIES)]
+            raw_reply = FALLBACK_REPLIES[hash(user_id) % len(FALLBACK_REPLIES)]
 
         # 5. 后处理过滤（根据好感度/情绪调整长度、去除格式符号）
-        reply = filter_reply(reply, affection_state.level.value, emotion_state.current_emotion.value)
+        filtered_reply = filter_reply(raw_reply, affection_state.level.value, emotion_state.current_emotion.value)
 
         # 6. LLM 评估好感度变化
-        affection_result = await self._affection.process_message(user_id, message, reply)
+        affection_result = await self._affection.process_message(user_id, message, filtered_reply)
 
         # 7. LLM 评估情绪变化
-        emotion_result = await self._emotion.process_message(user_id, message, reply)
+        emotion_result = await self._emotion.process_message(user_id, message, filtered_reply)
 
         # 8. 情绪冷却递减（每轮对话后 -1）
         emotion_result.state.tick_cooldown()
         await self._emotion._repo.save(emotion_result.state)
 
-        # 8. 保存到历史
+        # 9. 保存到历史（内存 + DB）
         self._history.add_message(user_id, "user", message)
-        self._history.add_message(user_id, "assistant", reply)
+        self._history.add_message(user_id, "assistant", filtered_reply)
+
+        # 10. 记忆系统：写入历史 + 检查触发
+        await self._memory.after_round(
+            user_id=user_id,
+            user_message=message,
+            ai_reply=filtered_reply,
+            raw_reply=raw_reply,
+            emotion=emotion_result.state.current_emotion.value,
+            affection_level=affection_result.new_state.level.value,
+            affection_points=affection_result.new_state.points,
+        )
 
         logger.info(
-            "聊天回复: user_id=%d, reply=%d chars, affection=%s(%d, delta=%d), emotion=%s",
-            user_id, len(reply),
+            "聊天回复: user_id=%d, reply=%d chars, affection=%s(%d, delta=%d), emotion=%s, memory=%s",
+            user_id, len(filtered_reply),
             affection_result.new_state.level.title,
             affection_result.new_state.points,
             affection_result.points_delta,
             emotion_result.state.current_emotion.value,
+            "有" if memory_state.has_memory else "无",
         )
 
         return ChatResult(
-            reply=reply,
+            reply=filtered_reply,
             affection_level=affection_result.new_state.level.title,
             affection_points=affection_result.new_state.points,
             affection_delta=affection_result.points_delta,

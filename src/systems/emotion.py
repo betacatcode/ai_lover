@@ -316,6 +316,12 @@ class PostgresEmotionRepository(EmotionRepository):
             await session.merge(model)
             await session.commit()
 
+    async def create_table(self) -> None:
+        """创建情绪表"""
+        from ..db.session import create_tables
+        await create_tables()
+        logger.info("情绪表创建/确认完成")
+
 
 # ── LLM 情绪评估 ──
 
