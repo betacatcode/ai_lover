@@ -73,8 +73,8 @@ class DBConfig:
 @dataclass
 class EmbeddingConfig:
     mode: str = "local"
-    model: str = "paraphrase-multilingual-MiniLM-L12-v2"
-    dimension: int = 384
+    model: str = "BAAI/bge-small-zh-v1.5"
+    dimension: int = 512
 
 
 @dataclass
@@ -158,8 +158,8 @@ def _parse_config(raw: dict) -> AppConfig:
             embedding=EmbeddingConfig(
                 mode=raw.get("memory", {}).get("embedding", {}).get("mode", "local"),
                 model=raw.get("memory", {}).get("embedding", {}).get("model",
-                         "paraphrase-multilingual-MiniLM-L12-v2"),
-                dimension=raw.get("memory", {}).get("embedding", {}).get("dimension", 384),
+                         "BAAI/bge-small-zh-v1.5"),
+                dimension=raw.get("memory", {}).get("embedding", {}).get("dimension", 512),
             ),
         ),
         web=WebConfig(
