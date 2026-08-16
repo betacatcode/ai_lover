@@ -23,6 +23,7 @@ from .bot.handlers import set_chat_service
 from .chat.service import ChatService
 from .config import get_config
 from .llm.client import LLMClient
+from .db.session import init_db, close_db, create_tables, create_vector_index
 
 # 日志目录（当前工作目录下 logs/）
 LOG_DIR = Path(os.getcwd()) / "logs"
@@ -182,7 +183,13 @@ async def main() -> None:
         logger.error("配置加载失败: %s", e)
         sys.exit(1)
 
-    # 创建核心服务
+    # 初始化数据库
+    init_db(config.memory.db.url)
+    await create_tables()
+    await create_vector_index("conversation_summary", "embedding", config.memory.embedding.dimension)
+    logger.info("数据库初始化完成: %s", config.memory.db.database)
+
+    # 创建核心服务（传入已初始化的 DB）
     llm_client, chat_service = create_services(config)
     logger.info("服务初始化完成: LLMClient + ChatService")
 
@@ -222,6 +229,11 @@ async def main() -> None:
         logger.info("收到中断信号")
     finally:
         await llm_client.close()
+        # 关闭数据库连接
+        try:
+            await close_db()
+        except Exception:
+            pass
         logger.info("服务已停止")
 
 

@@ -47,7 +47,40 @@ async def create_tables() -> None:
     if _engine is None:
         raise RuntimeError("数据库未初始化，请先调用 init_db()")
     async with _engine.begin() as conn:
+        # 启用 pgvector 扩展
+        await conn.execute(__import__("sqlalchemy").text("CREATE EXTENSION IF NOT EXISTS vector"))
         await conn.run_sync(Base.metadata.create_all)
+
+
+async def create_vector_index(table_name: str, column_name: str = "embedding", dimension: int = 512) -> None:
+    """
+    为表的向量列创建 ivfflat 索引。
+
+    Args:
+        table_name: 表名
+        column_name: 向量列名
+        dimension: 向量维度
+    """
+    if _engine is None:
+        raise RuntimeError("数据库未初始化，请先调用 init_db()")
+
+    # 检查列是否存在且类型正确（pgvector）
+    from sqlalchemy import text
+    async with _engine.begin() as conn:
+        # 添加向量列（如果不存在）
+        try:
+            await conn.execute(text(
+                f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS {column_name} vector({dimension})"
+            ))
+        except Exception:
+            pass  # 列已存在或类型已正确
+
+        # 创建 ivfflat 索引
+        index_name = f"idx_{table_name}_{column_name}"
+        await conn.execute(text(
+            f"CREATE INDEX IF NOT EXISTS {index_name} ON {table_name} "
+            f"USING ivfflat ({column_name} vector_cosine_ops) WITH (lists = 100)"
+        ))
 
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:

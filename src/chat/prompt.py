@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..systems.affection import AffectionState
     from ..systems.emotion import EmotionState
+    from ..memory.memory_system import MemoryState
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,7 @@ NOELLE_PERSONA = """你是诺艾尔（Noelle），原神中西风骑士团的女
 def build_system_prompt(
     affection_state: AffectionState | None = None,
     emotion_state: EmotionState | None = None,
+    memory_state: MemoryState | None = None,
 ) -> str:
     """
     组装 system prompt（Layer 1-5 动态组装）。
@@ -54,6 +56,7 @@ def build_system_prompt(
     Args:
         affection_state: 当前好感度状态，None 时使用默认等级 1
         emotion_state: 当前情绪状态，None 时使用平静
+        memory_state: 当前记忆状态，None 时不注入记忆层
 
     Returns:
         完整的 system prompt 文本
@@ -69,12 +72,20 @@ def build_system_prompt(
     if emotion_state is not None:
         parts.append(emotion_state.get_prompt_layer())
 
-    # TODO: Layer 4 - 长期记忆注入
-    # TODO: Layer 5 - 对话摘要注入
+    # Layer 4: 用户画像注入
+    if memory_state is not None and memory_state.profile_text:
+        parts.append(memory_state.get_profile_layer())
+
+    # Layer 5: 对话记忆注入（摘要 + 语义检索）
+    if memory_state is not None:
+        memory_layer = memory_state.get_memory_layer()
+        if memory_layer:
+            parts.append(memory_layer)
 
     system_prompt = "\n\n".join(parts)
     level_str = affection_state.level.title if affection_state else "默认"
     emotion_str = emotion_state.current_emotion.value if emotion_state else "平静"
-    logger.debug("组装 system prompt: %d chars (affection=%s, emotion=%s)",
-                 len(system_prompt), level_str, emotion_str)
+    memory_str = "有" if memory_state and memory_state.has_memory else "无"
+    logger.debug("组装 system prompt: %d chars (affection=%s, emotion=%s, memory=%s)",
+                 len(system_prompt), level_str, emotion_str, memory_str)
     return system_prompt
