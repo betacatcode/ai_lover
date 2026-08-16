@@ -1,4 +1,4 @@
-"""聊天服务 — 统一入口，编排历史/Prompt/LLM"""
+"""聊天服务 — 统一入口，编排历史/Prompt/LLM/情绪"""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from ..config import AppConfig
 from ..llm.client import LLMClient
 from ..llm.exceptions import LLMError, LLMTimeoutError
 from ..systems.affection import AffectionSystem, InMemoryAffectionRepository
+from ..systems.emotion import EmotionSystem, InMemoryEmotionRepository
 from .filter import filter_reply
 from .history import ChatHistoryManager
 from .prompt import build_system_prompt
@@ -37,11 +38,11 @@ class ChatService:
     """
     聊天业务层统一入口。
 
-    被 Telegram Bot 和 FastAPI 共同调用，管理对话历史、组装 Prompt、调用 LLM。
+    被 Telegram Bot 和 FastAPI 共同调用，管理对话历史、组装 Prompt、调用 LLM、更新情绪。
 
     用法：
         service = ChatService(llm_client, config)
-        reply = await service.chat(user_id=123, message="你好")
+        result = await service.chat(user_id=123, message="你好")
     """
 
     def __init__(self, llm_client: LLMClient, config: AppConfig):
@@ -49,8 +50,7 @@ class ChatService:
         self._config = config
         self._history = ChatHistoryManager(window_size=config.chat.history_window)
 
-        # 好感度系统（MVP 使用内存存储，后续可替换为 PostgreSQL）
-        # 传入 llm_client 用于 LLM 评估好感度变化
+        # 好感度系统
         affection_repo = InMemoryAffectionRepository()
         self._affection = AffectionSystem(
             repository=affection_repo,
@@ -58,7 +58,17 @@ class ChatService:
             initial_level=config.affection.initial_level,
             initial_points=config.affection.initial_points,
         )
-        logger.info("ChatService 初始化完成（好感度系统已启用，LLM 评估模式）")
+
+        # 情绪系统
+        emotion_repo = InMemoryEmotionRepository()
+        self._emotion = EmotionSystem(
+            repository=emotion_repo,
+            llm_client=llm_client,
+            decay_interval_minutes=config.emotion.decay_interval_minutes,
+            decay_amount=config.emotion.decay_amount,
+        )
+
+        logger.info("ChatService 初始化完成（好感度+情绪系统已启用，LLM 评估模式）")
 
     async def chat(self, user_id: int, message: str) -> ChatResult:
         """
@@ -73,11 +83,15 @@ class ChatService:
         """
         logger.info("聊天请求: user_id=%d, message=%r", user_id, message[:50])
 
-        # 1. 获取当前好感度状态（用于 Prompt 组装）
+        # 1. 获取当前好感度和情绪状态（用于 Prompt 组装）
         affection_state = await self._affection.get_state(user_id)
+        emotion_state = await self._emotion.get_state(user_id)
 
-        # 2. 组装 system prompt（含好感度层）
-        system_prompt = build_system_prompt(affection_state=affection_state)
+        # 2. 组装 system prompt（含好感度层 + 情绪层）
+        system_prompt = build_system_prompt(
+            affection_state=affection_state,
+            emotion_state=emotion_state,
+        )
 
         # 3. 获取历史 + 当前消息
         history = self._history.get_history(user_id)
@@ -94,27 +108,33 @@ class ChatService:
             reply = FALLBACK_REPLIES[hash(user_id) % len(FALLBACK_REPLIES)]
 
         # 5. 后处理过滤（根据好感度/情绪调整长度、去除格式符号）
-        reply = filter_reply(reply, affection_state.level.value)
+        reply = filter_reply(reply, affection_state.level.value, emotion_state.current_emotion.value)
 
-        # 6. LLM 评估好感度变化（传入用户消息 + 诺艾尔回复作为上下文）
+        # 6. LLM 评估好感度变化
         affection_result = await self._affection.process_message(user_id, message, reply)
 
-        # 7. 保存到历史
+        # 7. LLM 评估情绪变化
+        emotion_result = await self._emotion.process_message(user_id, message, reply)
+
+        # 8. 保存到历史
         self._history.add_message(user_id, "user", message)
         self._history.add_message(user_id, "assistant", reply)
 
-        logger.info("聊天回复: user_id=%d, reply=%d chars, affection=%s(%d, delta=%d)",
-                    user_id, len(reply),
-                    affection_result.new_state.level.title,
-                    affection_result.new_state.points,
-                    affection_result.points_delta)
+        logger.info(
+            "聊天回复: user_id=%d, reply=%d chars, affection=%s(%d, delta=%d), emotion=%s",
+            user_id, len(reply),
+            affection_result.new_state.level.title,
+            affection_result.new_state.points,
+            affection_result.points_delta,
+            emotion_result.state.current_emotion.value,
+        )
 
         return ChatResult(
             reply=reply,
             affection_level=affection_result.new_state.level.title,
             affection_points=affection_result.new_state.points,
             affection_delta=affection_result.points_delta,
-            emotion=self._config.emotion.default,
+            emotion=emotion_result.state.current_emotion.value,
         )
 
     def get_history(self, user_id: int) -> list[dict]:

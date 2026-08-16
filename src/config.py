@@ -47,6 +47,8 @@ class AffectionConfig:
 @dataclass
 class EmotionConfig:
     default: str = "平静"
+    decay_interval_minutes: int = 30   # 情绪衰减间隔（分钟）
+    decay_amount: int = 1              # 每次衰减强度
 
 
 @dataclass
@@ -139,6 +141,8 @@ def _parse_config(raw: dict) -> AppConfig:
         ),
         emotion=EmotionConfig(
             default=raw.get("emotion", {}).get("default", "平静"),
+            decay_interval_minutes=raw.get("emotion", {}).get("decay_interval_minutes", 30),
+            decay_amount=raw.get("emotion", {}).get("decay_amount", 1),
         ),
         debug=DebugConfig(
             enabled=raw.get("debug", {}).get("enabled", True),

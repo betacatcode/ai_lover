@@ -67,11 +67,23 @@ async def cmd_help(message: Message) -> None:
 @router.message(Command("status"))
 async def cmd_status(message: Message) -> None:
     """处理 /status 命令 — 查看诺艾尔当前状态"""
+    user_id = message.from_user.id if message.from_user else 0
+
+    affection_level = "未知"
+    affection_points = 0
+    emotion = "平静"
+
+    if _chat_service:
+        affection_state = await _chat_service._affection.get_state(user_id)
+        emotion_state = await _chat_service._emotion.get_state(user_id)
+        affection_level = affection_state.level.title
+        affection_points = affection_state.points
+        emotion = emotion_state.current_emotion.value
+
     status_text = (
-        "【诺艾尔的状态】\n"
-        "好感度：Lv.1 陌生\n"
-        "情绪：平静\n\n"
-        "（好感度和情绪系统即将上线～）"
+        f"【诺艾尔的状态】\n"
+        f"好感度：{affection_level}（{affection_points} pts）\n"
+        f"情绪：{emotion}"
     )
     await _safe_reply(message, status_text)
 

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..systems.affection import AffectionState
+    from ..systems.emotion import EmotionState
 
 logger = logging.getLogger(__name__)
 
@@ -45,14 +46,14 @@ NOELLE_PERSONA = """你是诺艾尔（Noelle），原神中西风骑士团的女
 
 def build_system_prompt(
     affection_state: AffectionState | None = None,
-    emotion: str = "平静",
+    emotion_state: EmotionState | None = None,
 ) -> str:
     """
     组装 system prompt（Layer 1-5 动态组装）。
 
     Args:
         affection_state: 当前好感度状态，None 时使用默认等级 1
-        emotion: 当前情绪状态（预留，后续 emotion-system 使用）
+        emotion_state: 当前情绪状态，None 时使用平静
 
     Returns:
         完整的 system prompt 文本
@@ -64,12 +65,16 @@ def build_system_prompt(
         from ..systems.affection import build_affection_prompt_layer
         parts.append(build_affection_prompt_layer(affection_state))
 
-    # TODO: Layer 3 - 情绪语气风格指令
+    # Layer 3: 情绪语气风格指令
+    if emotion_state is not None:
+        parts.append(emotion_state.get_prompt_layer())
+
     # TODO: Layer 4 - 长期记忆注入
     # TODO: Layer 5 - 对话摘要注入
 
     system_prompt = "\n\n".join(parts)
     level_str = affection_state.level.title if affection_state else "默认"
+    emotion_str = emotion_state.current_emotion.value if emotion_state else "平静"
     logger.debug("组装 system prompt: %d chars (affection=%s, emotion=%s)",
-                 len(system_prompt), level_str, emotion)
+                 len(system_prompt), level_str, emotion_str)
     return system_prompt
